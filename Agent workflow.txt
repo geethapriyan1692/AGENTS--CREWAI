@@ -1,0 +1,190 @@
+## **ARCHITECTURE OVERVIEW**
+ 
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         USER REQUEST                                 │
+│                  POST /roshonintentIdentifier/                       │
+│                  { query, session_id, agentList }                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 1: INTENT CLASSIFICATION (roshon.py line 680-728)            │
+│                                                                      │
+│  ┌────────────────────────────────────────────┐                    │
+│  │ IntentPipeline.query_db()                  │                    │
+│  │   ↓                                        │                    │
+│  │ MilvusDb.retrieve_content_native_hybrid()  │                    │
+│  │   • Embed query (sentence-transformers)    │                    │
+│  │   • Hybrid search (dense + sparse + RRF)   │                    │
+│  │   • Returns: intent_name, agent_id,        │                    │
+│  │     crew_id, confidence                    │                    │
+│  └────────────────────────────────────────────┘                    │
+│                         ↓                                           │
+│  ┌────────────────────────────────────────────┐                    │
+│  │ ModelService.classify_intent()             │                    │
+│  │   • Uses LLM (llama3.3:latest)            │                    │
+│  │   • Refines intent based on context        │                    │
+│  │   • Returns: IntentOutput with confidence  │                    │
+│  └────────────────────────────────────────────┘                    │
+│                         ↓                                           │
+│  Decision:                                                          │
+│    IF confidence <= 0.7 → Fallback (summarize all intents)        │
+│    ELSE → Proceed to agent selection                               │
+└─────────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 2: AGENT SELECTION (roshon.py line 730-744)                  │
+│                                                                      │
+│  Priority Order:                                                     │
+│    1. request.agentList (if provided)                               │
+│    2. intent.agent_id (if single agent)                            │
+│    3. intent.crew_id → crews.agents (if crew)                      │
+│                                                                      │
+│  Query Oracle:                                                       │
+│    SELECT agents FROM crews WHERE crew_id = {crew_id}              │
+│    • Returns: "1,2,3" (comma-separated agent_ids)                  │
+│    • Split into agent_list                                          │
+└─────────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 3: AGENT CONFIGURATION LOADING (roshon.py line 746-803)      │
+│                                                                      │
+│  FOR EACH agent_id IN agent_list:                                   │
+│                                                                      │
+│  ┌────────────────────────────────────────────┐                    │
+│  │ Query Oracle:                               │                    │
+│  │   SELECT agent_name, tools                  │                    │
+│  │   FROM agents WHERE agent_id = {id}         │                    │
+│  └────────────────────────────────────────────┘                    │
+│                         ↓                                           │
+│  ┌────────────────────────────────────────────┐                    │
+│  │ Parse tools (comma-separated tool_ids)     │                    │
+│  │   • tool_ids = "1,2,3"                     │                    │
+│  └────────────────────────────────────────────┘                    │
+│                         ↓                                           │
+│  ┌────────────────────────────────────────────┐                    │
+│  │ FOR EACH tool_id:                          │                    │
+│  │   Query Oracle:                             │                    │
+│  │     SELECT tool_type, tool_config           │                    │
+│  │     FROM tools WHERE tool_id = {id}         │                    │
+│  │                                             │                    │
+│  │   IF tool_type == "ApiTool":                │                    │
+│  │     Extract: url, method, payload           │                    │
+│  │     Build inputs:                           │                    │
+│  │       inputs["url1"] = url                  │                    │
+│  │       inputs["methodType1"] = method        │                    │
+│  │       inputs["payload1"] = payload          │                    │
+│  └────────────────────────────────────────────┘                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 4: CREWAI EXECUTION (roshon.py line 826-836)                 │
+│                                                                      │
+│  ┌────────────────────────────────────────────┐                    │
+│  │ Import & Reload crew_roshon.py             │                    │
+│  │   importlib.reload(crew_roshon)            │                    │
+│  └────────────────────────────────────────────┘                    │
+│                         ↓                                           │
+│  ┌────────────────────────────────────────────┐                    │
+│  │ Initialize RoshonCodeGeneration            │                    │
+│  │   crew = RoshonCodeGeneration(             │                    │
+│  │       session_id=session_id,               │                    │
+│  │       selected_agents=[agent_name],        │                    │
+│  │       selected_tasks=[agent_name+'_Task']  │                    │
+│  │   )                                         │                    │
+│  └────────────────────────────────────────────┘                    │
+│                         ↓                                           │
+│  ┌────────────────────────────────────────────┐                    │
+│  │ Build Crew (crew_roshon.py line 186-218)  │                    │
+│  │                                             │                    │
+│  │  • Load agents.yaml & tasks.yaml           │                    │
+│  │  • Create Agent instances                   │                    │
+│  │  • Create Task instances                    │                    │
+│  │  • Process = SEQUENTIAL                     │                    │
+│  │  • task_callback = on_task_complete        │                    │
+│  └────────────────────────────────────────────┘                    │
+│                         ↓                                           │
+│  ┌────────────────────────────────────────────┐                    │
+│  │ crew.kickoff(inputs)                       │                    │
+│  │   • Runs agents SEQUENTIALLY               │                    │
+│  │   • Each task triggers callback             │                    │
+│  └────────────────────────────────────────────┘                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 5: MEMORY STORAGE (crew_roshon.py line 103-175)              │
+│                                                                      │
+│  on_task_complete(task_output):                                     │
+│                                                                      │
+│  ┌────────────────────────────────────────────┐                    │
+│  │ Extract task result                         │                    │
+│  │   agent_name = task_output.agent           │                    │
+│  │   task_result = task_output.raw            │                    │
+│  └────────────────────────────────────────────┘                    │
+│                         ↓                                           │
+│  ┌────────────────────────────────────────────┐                    │
+│  │ Get agent_id from Oracle                   │                    │
+│  │   SELECT agent_id FROM agents              │                    │
+│  │   WHERE agent_name = {agent_name}          │                    │
+│  └────────────────────────────────────────────┘                    │
+│                         ↓                                           │
+│  ┌────────────────────────────────────────────┐                    │
+│  │ memory_manager.store_task_output()         │                    │
+│  │   • session_id                              │                    │
+│  │   • crew_id                                 │                    │
+│  │   • agent_id                                │                    │
+│  │   • task_result                             │                    │
+│  │   • metadata (timestamp, success)           │                    │
+│  └────────────────────────────────────────────┘                    │
+│                         ↓                                           │
+│  ┌─────────────────────┬──────────────────────┐                   │
+│  │ Redis Storage       │ Oracle Storage        │                   │
+│  │ (memory_manager.py  │ (memory_manager.py   │                   │
+│  │  line 263-274)      │  line 335-396)       │                   │
+│  │                     │                       │                   │
+│  │ Key:                │ Table:                │                   │
+│  │ session:{id}:history│ conversation_history  │                   │
+│  │                     │                       │                   │
+│  │ TTL: 24 hours       │ Permanent storage     │                   │
+│  │ Format: JSON list   │ Columns:              │                   │
+│  │                     │  - session_id         │                   │
+│  │                     │  - crew_id            │                   │
+│  │                     │  - agent_id           │                   │
+│  │                     │  - role (assistant)   │                   │
+│  │                     │  - message            │                   │
+│  │                     │  - metadata           │                   │
+│  │                     │  - created_at         │                   │
+│  └─────────────────────┴──────────────────────┘                   │
+└─────────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  STEP 6: RETURN RESPONSE (roshon.py line 836-837)                  │
+│                                                                      │
+│  response_json = {                                                   │
+│      "responseMessage": result,                                      │
+│      "intentFlag": intentFlag,                                       │
+│      "agentList": [agent_id]                                        │
+│  }                                                                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+ 
+---
+ 
+## **DATA FLOW SUMMARY**
+ 
+```
+User Query
+    ↓
+Milvus Vector Search (intent matching)
+    ↓
+LLM Intent Classification (confidence check)
+    ↓
+Oracle DB (get agent_ids from crew_id)
+    ↓
+Oracle DB (get agent config + tools)
+    ↓
+CrewAI Sequential Execution
+    ↓
+Memory Manager (Redis + Oracle)
+    ↓
+Response to User
